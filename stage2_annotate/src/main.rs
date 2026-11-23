@@ -1424,7 +1424,9 @@ struct Args {
     #[arg(long, default_value = "")]
     api_base: String,
 
-    #[arg(long, default_value = "")]
+    /// API key. Prefer the SPECOHOD_API_KEY environment variable: command-line arguments are
+    /// visible to every user of the machine (ps, /proc/<pid>/cmdline).
+    #[arg(long, env = "SPECOHOD_API_KEY", hide_env_values = true, default_value = "")]
     api_key: String,
 
     #[arg(long, default_value = "")]
