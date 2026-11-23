@@ -379,46 +379,35 @@ mod processor {
 
     // ---------- compare-specs ----------
 
-    /// Ask LLM whether two spec bodies are semantically equivalent.
-    /// Returns true for "yes", false for "no".
-    /// Retries up to 10 times on ambiguous answers. Bails out after 10 failures.
+    /// Ask the LLM whether changed dependency specs alter this module's spec.
+    /// Ok(None): unchanged ("NO"); Ok(Some(spec)): the revised spec.
+    /// LLM failures are errors: treating them as "unchanged" would silently stop propagation.
+    /// (Transport retries happen inside `LlmClient::generate`.)
     async fn update_specs(
         ctx: &GenerationContext<'_>,
         old_spec: &str,
         dep_spec: &str,
-    ) -> Option<String> {
-        let economy = ctx.economy.unwrap();
+    ) -> Result<Option<String>> {
+        let economy = ctx.economy.expect("economy context");
 
         let mut vars = HashMap::new();
         vars.insert("old_spec", old_spec.to_string());
         vars.insert("dep_spec", dep_spec.to_string());
+        let user_prompt = template::render(&economy.update_prompt, &vars);
 
-        let mut last_response = String::new();
-        for attempt in 1..=10 {
-            let user_prompt = template::render(&economy.update_prompt, &vars);
-            match ctx.llm.generate(ctx.prompts.system, &user_prompt).await {
-                Ok(response) => {
-                    last_response = response.clone();
-                    let last_word = response
-                        .trim()
-                        .split_whitespace()
-                        .last()
-                        .unwrap_or("")
-                        .trim_matches(|c: char| !c.is_alphabetic())
-                        .to_lowercase();
-
-                    if last_word == "no" || last_word == "нет" {
-                        return None;
-                    }
-                    return Some(response);
-                }
-                Err(e) => {
-                    log::warn!("Compare-spec attempt {}/10 failed: {:?}", attempt, e);
-                    return None;
-                }
-            }
+        let response = ctx.llm.generate(ctx.prompts.system, &user_prompt).await?;
+        let trimmed = response.trim();
+        let last_word = trimmed
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .trim_matches(|c: char| !c.is_alphabetic())
+            .to_lowercase();
+        // "NO" alone (or a short verdict ending in it) means unchanged; a revised spec is long.
+        if (last_word == "no" || last_word == "нет") && trimmed.len() < 200 {
+            return Ok(None);
         }
-        return None;
+        Ok(Some(response))
     }
 
     // ---------- outcome enum ----------
@@ -489,17 +478,27 @@ mod processor {
         for dep_path in deps {
             if economy.is_dirty(&dep_path) {
                 if let Some(dep_module) = modules.iter().find(|m| m.file_path == dep_path) {
-                    let spec_content = if prelim {
-                        std::fs::read_to_string(&dep_module.prelim_spec_path).unwrap()
+                    // A dependency revised in this run has its new text in *.new.md until the end.
+                    let candidates = if prelim {
+                        [&dep_module.new_prelim_spec_path, &dep_module.prelim_spec_path]
                     } else {
-                        std::fs::read_to_string(&dep_module.spec_path).unwrap()
+                        [&dep_module.new_spec_path, &dep_module.spec_path]
                     };
-                    dep_specs += &spec_content;
+                    match candidates.iter().find_map(|p| std::fs::read_to_string(p).ok()) {
+                        Some(spec) => {
+                            dep_specs += &format!(
+                                "\n--- Dependency spec: {:?} ---\n{}\n",
+                                dep_path,
+                                strip_hash_line(&spec)
+                            );
+                        }
+                        None => log::warn!("No spec found for changed dependency {:?}", dep_path),
+                    }
                 }
             }
         }
 
-        let response = update_specs(ctx, &old_body, &dep_specs).await;
+        let response = update_specs(ctx, &old_body, &dep_specs).await?;
 
         if let Some(spec) = response {
             let code_hash = compute_hash(&code);
@@ -644,12 +643,16 @@ mod processor {
             process_scc(&scc, modules, graph, &generation_ctx).await?;
         }
 
+        // Revised specs of affected modules are applied only once the whole graph is done.
         for module in modules {
-            if module.new_prelim_spec_path.exists() {
-                std::fs::rename(&module.new_prelim_spec_path, &module.prelim_spec_path);
-            }
-            if module.new_prelim_spec_path.exists() {
-                std::fs::rename(&module.new_spec_path, &module.spec_path);
+            for (new, old) in [
+                (&module.new_prelim_spec_path, &module.prelim_spec_path),
+                (&module.new_spec_path, &module.spec_path),
+            ] {
+                if new.exists() {
+                    std::fs::rename(new, old)
+                        .with_context(|| format!("Failed to apply {:?} -> {:?}", new, old))?;
+                }
             }
         }
 
