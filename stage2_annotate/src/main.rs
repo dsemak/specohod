@@ -764,7 +764,12 @@ mod llm {
         pub fn new(config: Config, stats: Arc<LlmStats>) -> Self {
             Self {
                 config,
-                client: Client::new(),
+                // Without a timeout a hung connection blocks forever and never reaches the retry loop.
+                client: Client::builder()
+                    .connect_timeout(Duration::from_secs(30))
+                    .timeout(Duration::from_secs(900))
+                    .build()
+                    .expect("failed to build HTTP client"),
                 stats,
             }
         }
